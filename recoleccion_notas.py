@@ -327,8 +327,14 @@ def _ejecutar_sync(job_id, codigo, password, periodo_especifico=None):
 
                     evaluaciones = []
                     try:
-                        # Esperamos FILAS reales, no solo el tag <table> vacío.
-                        page.wait_for_selector("table tbody tr", timeout=15000)
+                        # Antes solo esperábamos "hay una tabla con filas" —
+                        # pero la página puede tener más de una tabla, y esa
+                        # espera se daba por satisfecha con una que no era la
+                        # de notas (cargada rápido), mientras la real seguía
+                        # llegando por JS. Ahora esperamos texto real de
+                        # evaluación (PRACTICA/EXAMEN), que solo existe en la
+                        # tabla que de verdad nos importa.
+                        page.wait_for_selector("text=/PRACTICA|EXAMEN/i", timeout=15000)
                         for t in page.locator("table").all():
                             for f in t.locator("tbody tr").all():
                                 c = f.locator("td").all()
