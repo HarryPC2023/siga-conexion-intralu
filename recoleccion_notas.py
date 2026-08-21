@@ -352,9 +352,21 @@ def _ejecutar_sync(job_id, codigo, password, periodo_especifico=None):
                                             }
                                         )
                     except Exception:
+                        # Diagnóstico: capturamos qué nos devolvió realmente la
+                        # página en vez de solo saber que se agotó el tiempo —
+                        # así distinguimos "estaba cargando, muy lento" de "la
+                        # UNI nos mandó una página de bloqueo/verificación
+                        # distinta a la normal" (sospecha principal: IPs de
+                        # datacenter tratadas distinto a IPs residenciales).
+                        try:
+                            titulo_pagina = page.title()
+                            fragmento_html = page.content()[:300].replace("\n", " ")
+                        except Exception:
+                            titulo_pagina = "(no se pudo leer)"
+                            fragmento_html = "(no se pudo leer)"
                         logger.info(
-                            "Job %s: sin tabla de notas en %s (%s)",
-                            job_id, c_info["cod_curso"], periodo,
+                            "Job %s: sin tabla de notas en %s (%s) — título: %r — inicio HTML: %r",
+                            job_id, c_info["cod_curso"], periodo, titulo_pagina, fragmento_html,
                         )
 
                     creditos_val = c_info["creditos"]
