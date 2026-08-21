@@ -336,14 +336,19 @@ def _ejecutar_sync(job_id, codigo, password, periodo_especifico=None):
                             page.goto(url_det, wait_until="domcontentloaded")
 
                         try:
-                            # Antes solo esperábamos "hay una tabla con filas" —
-                            # pero la página puede tener más de una tabla, y esa
-                            # espera se daba por satisfecha con una que no era la
-                            # de notas (cargada rápido), mientras la real seguía
-                            # llegando por JS. Ahora esperamos texto real de
-                            # evaluación (PRACTICA/EXAMEN), que solo existe en la
+                            # OJO: "text=/PRACTICA|EXAMEN/i" busca ese texto en TODA
+                            # la página, no solo en la tabla de notas — si esa
+                            # palabra existe en cualquier otro lugar fijo de la
+                            # página (un menú, un enlace), el wait se satisface al
+                            # instante sin haber esperado realmente a que la tabla
+                            # de notas del curso terminara de pintarse por JS. Por
+                            # eso escopeamos el locator a filas de tabla reales
+                            # (table tbody tr) que CONTENGAN ese texto — así solo
+                            # cuenta como "encontrado" cuando está dentro de la
                             # tabla que de verdad nos importa.
-                            page.wait_for_selector("text=/PRACTICA|EXAMEN/i", timeout=20000)
+                            page.locator(
+                                "table tbody tr", has_text=re.compile("PRACTICA|EXAMEN", re.I)
+                            ).first.wait_for(timeout=20000)
                             for t in page.locator("table").all():
                                 for f in t.locator("tbody tr").all():
                                     c = f.locator("td").all()
