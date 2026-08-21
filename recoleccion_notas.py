@@ -236,7 +236,7 @@ def _ejecutar_sync(job_id, codigo, password, periodo_especifico=None):
             page.click("#btn-login")
 
             try:
-                page.wait_for_url("**/home**", timeout=12000)
+                page.wait_for_url("**/home**", timeout=20000)
             except Exception:
                 with _jobs_lock:
                     _jobs[job_id]["status"] = "error"
@@ -269,7 +269,7 @@ def _ejecutar_sync(job_id, codigo, password, periodo_especifico=None):
                 page.goto(url_periodo, wait_until="domcontentloaded")
 
                 try:
-                    page.wait_for_selector("table", timeout=3000)
+                    page.wait_for_selector("table", timeout=6000)
                 except Exception:
                     continue  # Sin cursos en este periodo, salta rápido al siguiente
 
@@ -317,14 +317,18 @@ def _ejecutar_sync(job_id, codigo, password, periodo_especifico=None):
                     # antes de que existieran las filas, por eso siempre
                     # salía vacío. Esperamos a que la red se calme.
                     try:
-                        page.goto(url_det, wait_until="networkidle", timeout=15000)
+                        page.goto(url_det, wait_until="networkidle", timeout=30000)
+                        # Colchón extra: con la CPU limitada del plan gratuito, a
+                        # veces el JS termina de pintar la tabla un poco después
+                        # de que la red ya se calmó.
+                        page.wait_for_timeout(500)
                     except Exception:
                         page.goto(url_det, wait_until="domcontentloaded")
 
                     evaluaciones = []
                     try:
                         # Esperamos FILAS reales, no solo el tag <table> vacío.
-                        page.wait_for_selector("table tbody tr", timeout=8000)
+                        page.wait_for_selector("table tbody tr", timeout=15000)
                         for t in page.locator("table").all():
                             for f in t.locator("tbody tr").all():
                                 c = f.locator("td").all()
