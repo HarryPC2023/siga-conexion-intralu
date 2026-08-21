@@ -304,6 +304,14 @@ def _ejecutar_sync(job_id, codigo, password, periodo_especifico=None):
                             )
 
                 # Ahora sí, visitamos el detalle de cada curso para sacar sus notas.
+                # MAX_INTENTOS_NOTAS = 2: en el plan gratuito de Render (0.1 CPU
+                # compartida) la tabla de notas a veces tarda más en pintar por
+                # JS de lo que cualquier timeout razonable puede cubrir sin volver
+                # lentísima TODA la sync. En vez de subir el timeout al infinito,
+                # si el primer intento no encuentra la tabla, recargamos esa misma
+                # página del curso una vez más antes de rendirnos — en la práctica
+                # un segundo intento casi siempre alcanza a cargar bien.
+                MAX_INTENTOS_NOTAS = 2
                 cursos_lista = []
                 for c_info in cursos_temp:
                     logger.info(
@@ -311,69 +319,82 @@ def _ejecutar_sync(job_id, codigo, password, periodo_especifico=None):
                     )
                     url_det = f"https://alumnos.uni.edu.pe/informacion-academica/cursos/{periodo}/{c_info['cod_curso']}/{c_info['seccion']}"
 
-                    # networkidle (no domcontentloaded): la tabla de notas de
-                    # esta página en particular parece cargar vía JS después
-                    # del render inicial — con domcontentloaded llegábamos
-                    # antes de que existieran las filas, por eso siempre
-                    # salía vacío. Esperamos a que la red se calme.
-                    try:
-                        page.goto(url_det, wait_until="networkidle", timeout=30000)
-                        # Colchón extra: con la CPU limitada del plan gratuito, a
-                        # veces el JS termina de pintar la tabla un poco después
-                        # de que la red ya se calmó.
-                        page.wait_for_timeout(500)
-                    except Exception:
-                        page.goto(url_det, wait_until="domcontentloaded")
-
                     evaluaciones = []
-                    try:
-                        # Antes solo esperábamos "hay una tabla con filas" —
-                        # pero la página puede tener más de una tabla, y esa
-                        # espera se daba por satisfecha con una que no era la
-                        # de notas (cargada rápido), mientras la real seguía
-                        # llegando por JS. Ahora esperamos texto real de
-                        # evaluación (PRACTICA/EXAMEN), que solo existe en la
-                        # tabla que de verdad nos importa.
-                        page.wait_for_selector("text=/PRACTICA|EXAMEN/i", timeout=15000)
-                        for t in page.locator("table").all():
-                            for f in t.locator("tbody tr").all():
-                                c = f.locator("td").all()
-                                if len(c) >= 2:
-                                    # text_content() en vez de inner_text(): este
-                                    # último devuelve "" si el elemento está oculto
-                                    # (ej. dentro de una pestaña no activa), que es
-                                    # nuestra sospecha principal de por qué las
-                                    # Prácticas Calificadas no estaban llegando.
-                                    nom_e = (c[0].text_content() or "").strip()
-                                    not_e = (c[1].text_content() or "").strip()
-                                    if nom_e and not nom_e.isdigit():
-                                        try:
-                                            val_n = float(not_e)
-                                        except ValueError:
-                                            val_n = None
-                                        evaluaciones.append(
-                                            {
-                                                "etiqueta": simplificar_etiqueta(nom_e),
-                                                "nota": val_n,
-                                            }
-                                        )
-                    except Exception:
-                        # Diagnóstico: capturamos qué nos devolvió realmente la
-                        # página en vez de solo saber que se agotó el tiempo —
-                        # así distinguimos "estaba cargando, muy lento" de "la
-                        # UNI nos mandó una página de bloqueo/verificación
-                        # distinta a la normal" (sospecha principal: IPs de
-                        # datacenter tratadas distinto a IPs residenciales).
+                    for intento in range(1, MAX_INTENTOS_NOTAS + 1):
+                        # networkidle (no domcontentloaded): la tabla de notas de
+                        # esta página en particular parece cargar vía JS después
+                        # del render inicial — con domcontentloaded llegábamos
+                        # antes de que existieran las filas, por eso siempre
+                        # salía vacío. Esperamos a que la red se calme.
                         try:
-                            titulo_pagina = page.title()
-                            fragmento_html = page.content()[:300].replace("\n", " ")
+                            page.goto(url_det, wait_until="networkidle", timeout=45000)
+                            # Colchón extra: con la CPU limitada del plan gratuito, a
+                            # veces el JS termina de pintar la tabla un poco después
+                            # de que la red ya se calmó.
+                            page.wait_for_timeout(800)
                         except Exception:
-                            titulo_pagina = "(no se pudo leer)"
-                            fragmento_html = "(no se pudo leer)"
-                        logger.info(
-                            "Job %s: sin tabla de notas en %s (%s) — título: %r — inicio HTML: %r",
-                            job_id, c_info["cod_curso"], periodo, titulo_pagina, fragmento_html,
-                        )
+                            page.goto(url_det, wait_until="domcontentloaded")
+
+                        try:
+                            # Antes solo esperábamos "hay una tabla con filas" —
+                            # pero la página puede tener más de una tabla, y esa
+                            # espera se daba por satisfecha con una que no era la
+                            # de notas (cargada rápido), mientras la real seguía
+                            # llegando por JS. Ahora esperamos texto real de
+                            # evaluación (PRACTICA/EXAMEN), que solo existe en la
+                            # tabla que de verdad nos importa.
+                            page.wait_for_selector("text=/PRACTICA|EXAMEN/i", timeout=20000)
+                            for t in page.locator("table").all():
+                                for f in t.locator("tbody tr").all():
+                                    c = f.locator("td").all()
+                                    if len(c) >= 2:
+                                        # text_content() en vez de inner_text(): este
+                                        # último devuelve "" si el elemento está oculto
+                                        # (ej. dentro de una pestaña no activa), que es
+                                        # nuestra sospecha principal de por qué las
+                                        # Prácticas Calificadas no estaban llegando.
+                                        nom_e = (c[0].text_content() or "").strip()
+                                        not_e = (c[1].text_content() or "").strip()
+                                        if nom_e and not nom_e.isdigit():
+                                            try:
+                                                val_n = float(not_e)
+                                            except ValueError:
+                                                val_n = None
+                                            evaluaciones.append(
+                                                {
+                                                    "etiqueta": simplificar_etiqueta(nom_e),
+                                                    "nota": val_n,
+                                                }
+                                            )
+                            break  # tabla encontrada, no hace falta reintentar
+                        except Exception:
+                            if intento < MAX_INTENTOS_NOTAS:
+                                logger.info(
+                                    "Job %s: intento %d/%d sin tabla de notas en %s (%s), reintentando...",
+                                    job_id, intento, MAX_INTENTOS_NOTAS, c_info["cod_curso"], periodo,
+                                )
+                                continue
+                            # Diagnóstico tras agotar los reintentos: capturamos qué
+                            # nos devolvió realmente la página en vez de solo saber
+                            # que se agotó el tiempo — así distinguimos "estaba
+                            # cargando, muy lento" de "la UNI nos mandó una página de
+                            # bloqueo/verificación distinta a la normal" (sospecha:
+                            # IPs de datacenter tratadas distinto a residenciales).
+                            try:
+                                titulo_pagina = page.title()
+                                fragmento_html = page.content()[:300].replace("\n", " ")
+                            except Exception:
+                                titulo_pagina = "(no se pudo leer)"
+                                fragmento_html = "(no se pudo leer)"
+                            logger.info(
+                                "Job %s: sin tabla de notas en %s (%s) tras %d intentos — título: %r — inicio HTML: %r",
+                                job_id, c_info["cod_curso"], periodo, MAX_INTENTOS_NOTAS, titulo_pagina, fragmento_html,
+                            )
+
+                    logger.info(
+                        "Job %s:   %s (%s) -> %d evaluaciones encontradas",
+                        job_id, c_info["cod_curso"], periodo, len(evaluaciones),
+                    )
 
                     creditos_val = c_info["creditos"]
                     cursos_lista.append(
