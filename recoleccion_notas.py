@@ -4,7 +4,9 @@ import re
 import threading
 import time
 import uuid
+from urllib.parse import unquote
 
+import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from playwright.sync_api import sync_playwright
@@ -490,6 +492,186 @@ def consultar_sync(job_id: str):
             "periodo_actual": job.get("periodo_actual"),
             "periodos": job.get("periodos"),
         }
+
+
+# ================================================================
+# SINCRONIZACIÓN CON MATRÍCULA UNI (Generador de Horarios)
+# A diferencia de /api/sync-intralu, esta sí es síncrona: Playwright
+# solo se usa para el login (obtener el accessToken de la cookie), y
+# el resto es puro `requests` contra la API de Matrícula — toma
+# segundos, no minutos, así que no necesita el patrón de job/polling.
+# Comparte _semaforo_sync con Intralú (mismo límite de RAM del plan
+# gratuito): si ya hay una sync pesada en curso, esta espera su turno
+# en vez de arrancar un segundo Chromium en paralelo.
+# ================================================================
+MATRICULA_BASE = "https://matricula-alumno.uni.edu.pe"
+
+DIAS_MAP_MATRICULA = {
+    "LUNES": "LUNES",
+    "MARTES": "MARTES",
+    "MIERCOLES": "MIERCOLES",
+    "JUEVES": "JUEVES",
+    "VIERNES": "VIERNES",
+    "SABADO": "SABADO",
+    "DOMINGO": "DOMINGO",
+}
+
+
+def _normalizar_dia_matricula(dia):
+    if not dia:
+        return ""
+    s = dia.strip().upper()
+    s = (s.replace("Á", "A").replace("É", "E")
+           .replace("Í", "I").replace("Ó", "O").replace("Ú", "U"))
+    return DIAS_MAP_MATRICULA.get(s, s)
+
+
+def _hora_a_entero_matricula(hora_str):
+    if not hora_str:
+        return None
+    try:
+        partes = hora_str.strip().split(":")
+        h = int(partes[0])
+        m = int(partes[1]) if len(partes) > 1 else 0
+        return h * 100 + m
+    except (ValueError, IndexError):
+        return None
+
+
+def _obtener_token_matricula(codigo, password):
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context()
+        page = context.new_page()
+
+        page.goto("https://alumnos.uni.edu.pe/login", wait_until="domcontentloaded")
+        page.fill("input[type='text'], #txt-codigo", codigo)
+        page.fill("input[type='password'], #txt-password", password)
+        page.click("button:has-text('Ingresar'), #btn-login")
+
+        try:
+            page.wait_for_url("**/home**", timeout=12000)
+        except Exception:
+            browser.close()
+            raise HTTPException(status_code=401, detail="Código o contraseña incorrectos en Intralú.")
+
+        page.goto(f"{MATRICULA_BASE}/login", wait_until="domcontentloaded")
+        page.wait_for_timeout(1500)
+        page.fill("input[type='text']", codigo)
+        page.fill("input[type='password']", password)
+        page.click("button:has-text('Iniciar Sesión')")
+
+        token = None
+        for _ in range(20):
+            for c in context.cookies():
+                if c["name"] == "accessToken":
+                    token = c["value"]
+                    break
+            if token:
+                break
+            page.wait_for_timeout(500)
+
+        browser.close()
+
+        if not token:
+            raise HTTPException(
+                status_code=401,
+                detail="Código o contraseña incorrectos en Matrícula, o no se pudo obtener el token de acceso."
+            )
+        return unquote(token)
+
+
+@app.post("/api/sync-horarios")
+def sync_horarios(credentials: LoginRequest):
+    adquirido = _semaforo_sync.acquire(blocking=False)
+    if not adquirido:
+        raise HTTPException(
+            status_code=429,
+            detail="Hay una sincronización en curso ahora mismo. Intenta de nuevo en un minuto."
+        )
+
+    try:
+        token = _obtener_token_matricula(credentials.codigo, credentials.password)
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+
+        resp_ficha = requests.get(f"{MATRICULA_BASE}/api/matricula/ficha", headers=headers, timeout=15)
+        if resp_ficha.status_code != 200:
+            raise HTTPException(status_code=502, detail="No se pudo obtener la ficha de matrícula.")
+
+        ficha = resp_ficha.json()
+        cursos_disponibles = ficha.get("cursos", [])
+
+        carga = {}
+        cursos_sin_horario = []
+
+        for curso in cursos_disponibles:
+            codigo_curso = curso.get("codigo")
+            nombre_curso = (curso.get("nombre") or "").rstrip("-").strip()
+
+            if not curso.get("tieneHorario"):
+                cursos_sin_horario.append({"codigo": codigo_curso, "nombre": nombre_curso})
+                continue
+
+            resp_horario = requests.get(
+                f"{MATRICULA_BASE}/api/matricula/cursos/{codigo_curso}/horarios",
+                headers=headers, timeout=15,
+            )
+            if resp_horario.status_code != 200:
+                cursos_sin_horario.append({
+                    "codigo": codigo_curso, "nombre": nombre_curso,
+                    "error": f"HTTP {resp_horario.status_code}",
+                })
+                continue
+
+            secciones = resp_horario.json().get("secciones", [])
+            if not secciones:
+                continue
+
+            carga[nombre_curso] = {}
+            for seccion in secciones:
+                letra_seccion = seccion.get("seccion")
+                docente = "POR ASIGNAR"
+                clases = []
+                for h in seccion.get("horario", []):
+                    dia = _normalizar_dia_matricula(h.get("dia"))
+                    ini = _hora_a_entero_matricula(h.get("horaInicio"))
+                    fin = _hora_a_entero_matricula(h.get("horaFin"))
+                    if ini is None or fin is None or ini >= fin:
+                        continue
+                    if h.get("docente"):
+                        docente = h["docente"]
+                    clases.append({
+                        "dia": dia, "ini": ini, "fin": fin,
+                        "tipo": (h.get("concepto") or "P").upper(),
+                        "aula": h.get("aula") or "S/A",
+                    })
+
+                carga[nombre_curso][letra_seccion] = {
+                    "docente": docente,
+                    "codigo": codigo_curso,
+                    "vacantesMaximas": seccion.get("vacantesMaximas"),
+                    "vacantesOcupadas": seccion.get("vacantesOcupadas"),
+                    "vacantesDisponibles": seccion.get("vacantesDisponibles"),
+                    "clases": clases,
+                }
+
+        return {
+            "status": "success",
+            "periodo": ficha.get("periodo"),
+            "total_cursos": len(cursos_disponibles),
+            "cursos_con_horario": len(carga),
+            "cursos_sin_horario": cursos_sin_horario,
+            "cursos": cursos_disponibles,
+            "carga": carga,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error durante la sincronización con Matrícula UNI")
+        raise HTTPException(status_code=500, detail=f"Error en servidor: {str(e)}")
+    finally:
+        _semaforo_sync.release()
 
 
 if __name__ == "__main__":
