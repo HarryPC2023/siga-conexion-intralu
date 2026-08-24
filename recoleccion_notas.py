@@ -576,7 +576,7 @@ def _obtener_token_matricula(codigo, password):
         if not token:
             raise HTTPException(
                 status_code=401,
-                detail="Código o contraseña incorrectos en Matrícula, o no se pudo obtener el token de acceso."
+                detail="Código o contraseña incorrectos en Matrícula, o la página no está habilitada."
             )
         return unquote(token)
 
