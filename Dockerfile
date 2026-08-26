@@ -14,9 +14,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # El navegador Chromium ya viene instalado en la imagen base de
 # Playwright — no hace falta "playwright install" de nuevo.
 
-COPY recoleccion_notas.py .
+COPY scraping_intralu.py .
 
 # Railway inyecta la variable PORT en tiempo de ejecución (no la
 # conocemos todavía al construir la imagen), así que el comando de
 # arranque debe leerla en shell, no como argumento fijo.
-CMD ["sh", "-c", "python recoleccion_notas.py"]
+CMD ["sh", "-c", "python scraping_intralu.py"]

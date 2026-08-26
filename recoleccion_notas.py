@@ -544,17 +544,13 @@ def _obtener_token_matricula(codigo, password):
         context = browser.new_context()
         page = context.new_page()
 
-        page.goto("https://alumnos.uni.edu.pe/login", wait_until="domcontentloaded")
-        page.fill("input[type='text'], #txt-codigo", codigo)
-        page.fill("input[type='password'], #txt-password", password)
-        page.click("button:has-text('Ingresar'), #btn-login")
-
-        try:
-            page.wait_for_url("**/home**", timeout=12000)
-        except Exception:
-            browser.close()
-            raise HTTPException(status_code=401, detail="Código o contraseña incorrectos en Intralú.")
-
+        # Antes se pasaba primero por el login de Intralú (alumnos.uni.edu.pe)
+        # y recién después por el de Matrícula — dos sistemas de autenticación
+        # totalmente independientes (por eso pedían código y contraseña dos
+        # veces, cada uno con su propia sesión). Como esta función solo
+        # necesita el accessToken de Matrícula, vamos directo a su login:
+        # nos ahorramos una navegación completa y un login entero, así el
+        # proceso baja de los ~1:40 actuales a bastante menos.
         page.goto(f"{MATRICULA_BASE}/login", wait_until="domcontentloaded")
         page.wait_for_timeout(1500)
         page.fill("input[type='text']", codigo)
@@ -589,6 +585,8 @@ def sync_horarios(credentials: LoginRequest):
             status_code=429,
             detail="Hay una sincronización en curso ahora mismo. Intenta de nuevo en un minuto."
         )
+
+    inicio = time.time()
 
     try:
         token = _obtener_token_matricula(credentials.codigo, credentials.password)
@@ -655,6 +653,12 @@ def sync_horarios(credentials: LoginRequest):
                     "clases": clases,
                 }
 
+        duracion = time.time() - inicio
+        logger.info(
+            "Sync Matrícula: ✅ COMPLETA en %.1fs — %d cursos con horario, %d sin horario",
+            duracion, len(carga), len(cursos_sin_horario),
+        )
+
         return {
             "status": "success",
             "periodo": ficha.get("periodo"),
@@ -666,9 +670,11 @@ def sync_horarios(credentials: LoginRequest):
         }
 
     except HTTPException:
+        logger.info("Sync Matrícula: ❌ TERMINÓ CON ERROR tras %.1fs", time.time() - inicio)
         raise
     except Exception as e:
         logger.exception("Error durante la sincronización con Matrícula UNI")
+        logger.info("Sync Matrícula: ❌ TERMINÓ CON ERROR tras %.1fs", time.time() - inicio)
         raise HTTPException(status_code=500, detail=f"Error en servidor: {str(e)}")
     finally:
         _semaforo_sync.release()
