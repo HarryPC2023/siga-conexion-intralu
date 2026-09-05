@@ -62,6 +62,30 @@ class LoginRequest(BaseModel):
     )
 
 
+class LoginPorCookieRequest(BaseModel):
+    """Reemplaza a LoginRequest para /api/sync-intralu ahora que Intralú
+    agregó reCAPTCHA a su login: en vez de código+contraseña, el
+    alumno inicia sesión él mismo (resolviendo el reCAPTCHA) y la
+    extensión de Chrome 'SIGA Conector' lee las cookies de esa sesión
+    ya existente para prestárselas a Playwright."""
+    session_cookie: str = Field(..., description="Valor de la cookie 'intranet_alumno_session' leída por la extensión.")
+    xsrf_token: str | None = Field(default=None, description="Valor de la cookie 'XSRF-TOKEN', si existe.")
+    codigo: str | None = Field(
+        default=None,
+        examples=["20231059E"],
+        description=(
+            "OPCIONAL. Código UNI del alumno — ya NO se usa para autenticar (eso "
+            "lo hace la cookie de sesión), solo para calcular desde qué año buscar "
+            "cuando se elige sincronizar 'todos los periodos'. No es un dato sensible."
+        ),
+    )
+    periodo: str | None = Field(
+        default=None,
+        examples=["20262"],
+        description="OPCIONAL. Déjalo vacío/null para sincronizar TODOS tus periodos. Para uno solo, usa el formato crudo o con guion.",
+    )
+
+
 def normalizar_periodo(periodo):
     """Acepta tanto el formato crudo ('20262') como el formato con guion
     ('2026-2', el que usa Intranotas) y devuelve siempre el crudo, que es
@@ -207,46 +231,75 @@ def simplificar_etiqueta(texto):
     return t
 
 
-def _ejecutar_sync(job_id, codigo, password, periodo_especifico=None):
-    """Corre en un hilo aparte (no bloquea ningún request HTTP). Guarda
-    el progreso y el resultado final en _jobs[job_id] para que el
-    frontend los recoja haciendo polling contra GET /api/sync-intralu/{job_id}."""
-    periodo_especifico = normalizar_periodo(periodo_especifico)
-    adquirido = _semaforo_sync.acquire(blocking=False)
-    if not adquirido:
-        with _jobs_lock:
-            _jobs[job_id]["status"] = "error"
-            _jobs[job_id]["status_code"] = 429
-            _jobs[job_id]["detail"] = "Hay muchas sincronizaciones en curso ahora mismo. Intenta de nuevo en un minuto."
-        logger.info("Job %s: ❌ RECHAZADO (ya hay %d syncs en curso)", job_id, MAX_SYNCS_SIMULTANEOS)
-        return
-
-    inicio = time.time()
-
-    data_por_periodo = {}
-    browser = None
+def _login_legacy_password(page, job_id, codigo, password, inicio):
+    """Login viejo por código+contraseña. YA NO SE USA — Intralú agregó
+    reCAPTCHA a este formulario y este flujo se queda atascado ahí.
+    Se conserva sin ruta expuesta por si algún día Intralú quita el
+    reCAPTCHA; en ese caso solo hace falta volver a exponer un endpoint
+    que llame a esta función. Devuelve True si el login funcionó."""
+    page.goto("https://alumnos.uni.edu.pe/login", wait_until="domcontentloaded")
+    page.fill("#txt-codigo", codigo)
+    page.fill("#txt-password", password)
+    page.click("#btn-login")
 
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
+        page.wait_for_url("**/home**", timeout=20000)
+        return True
+    except Exception:
+        with _jobs_lock:
+            _jobs[job_id]["status"] = "error"
+            _jobs[job_id]["status_code"] = 401
+            _jobs[job_id]["detail"] = "Código o contraseña incorrectos en Intralú."
+        logger.info("Job %s: ❌ LOGIN FALLIDO tras %.1fs", job_id, time.time() - inicio)
+        return False
 
-            # 1. Login dinámico
-            page.goto("https://alumnos.uni.edu.pe/login", wait_until="domcontentloaded")
-            page.fill("#txt-codigo", codigo)
-            page.fill("#txt-password", password)
-            page.click("#btn-login")
 
-            try:
-                page.wait_for_url("**/home**", timeout=20000)
-            except Exception:
-                with _jobs_lock:
-                    _jobs[job_id]["status"] = "error"
-                    _jobs[job_id]["status_code"] = 401
-                    _jobs[job_id]["detail"] = "Código o contraseña incorrectos en Intralú."
-                logger.info("Job %s: ❌ LOGIN FALLIDO tras %.1fs", job_id, time.time() - inicio)
-                return
+def _login_por_cookie(context, page, job_id, session_cookie, xsrf_token, inicio):
+    """Login nuevo: en vez de autenticar de cero (bloqueado por el
+    reCAPTCHA de Intralú), le prestamos a Playwright la cookie de una
+    sesión que el propio alumno ya abrió resolviendo el reCAPTCHA él
+    mismo — capturada por la extensión de Chrome 'SIGA Conector'.
+    Devuelve True si la sesión resultó válida."""
+    cookies = [{
+        "name": "intranet_alumno_session",
+        "value": session_cookie,
+        "domain": "alumnos.uni.edu.pe",
+        "path": "/",
+        "httpOnly": True,
+        "secure": True,
+    }]
+    if xsrf_token:
+        cookies.append({
+            "name": "XSRF-TOKEN",
+            "value": xsrf_token,
+            "domain": "alumnos.uni.edu.pe",
+            "path": "/",
+            "secure": True,
+        })
+    context.add_cookies(cookies)
 
+    page.goto("https://alumnos.uni.edu.pe/home", wait_until="domcontentloaded")
+
+    # Si la cookie ya expiró o cerró sesión, Intralú nos rebota solo a /login.
+    if "/login" in page.url:
+        with _jobs_lock:
+            _jobs[job_id]["status"] = "error"
+            _jobs[job_id]["status_code"] = 401
+            _jobs[job_id]["detail"] = (
+                "Tu sesión de Intralú expiró o no se detectó. Vuelve a iniciar "
+                "sesión en Intralú y presiona Sincronizar de nuevo."
+            )
+        logger.info("Job %s: ❌ SESIÓN DE COOKIE INVÁLIDA tras %.1fs", job_id, time.time() - inicio)
+        return False
+    return True
+
+
+def _escanear_periodos(job_id, page, codigo, periodo_especifico, inicio):
+    """Núcleo del scraping (compartido por cualquier método de login):
+    asume que `page` YA tiene una sesión válida de Intralú cargada, y
+    recorre los periodos pedidos guardando notas por curso en _jobs."""
+    data_por_periodo = {}
+    try:
             # 2. Rango de periodos: uno solo si el usuario pidió un ciclo
             # específico, o acotado por el año de ingreso (del código) y el
             # periodo real más reciente si pidió "todos".
@@ -438,6 +491,84 @@ def _ejecutar_sync(job_id, codigo, password, periodo_especifico=None):
             _jobs[job_id]["status_code"] = 500
             _jobs[job_id]["detail"] = "No se pudo completar la sincronización con Intralú. Intenta de nuevo más tarde."
         logger.info("Job %s: ❌ TERMINÓ CON ERROR tras %.1fs", job_id, time.time() - inicio)
+
+
+def _ejecutar_sync_cookie(job_id, session_cookie, xsrf_token, codigo, periodo_especifico=None):
+    """Flujo ACTUAL (post-reCAPTCHA): corre en un hilo aparte, guarda
+    progreso/resultado en _jobs[job_id] para que el frontend haga
+    polling contra GET /api/sync-intralu/{job_id}. La sesión ya viene
+    hecha (cookie prestada por la extensión 'SIGA Conector')."""
+    periodo_especifico = normalizar_periodo(periodo_especifico)
+    adquirido = _semaforo_sync.acquire(blocking=False)
+    if not adquirido:
+        with _jobs_lock:
+            _jobs[job_id]["status"] = "error"
+            _jobs[job_id]["status_code"] = 429
+            _jobs[job_id]["detail"] = "Hay muchas sincronizaciones en curso ahora mismo. Intenta de nuevo en un minuto."
+        logger.info("Job %s: ❌ RECHAZADO (ya hay %d syncs en curso)", job_id, MAX_SYNCS_SIMULTANEOS)
+        return
+
+    inicio = time.time()
+    browser = None
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context()
+            page = context.new_page()
+
+            if not _login_por_cookie(context, page, job_id, session_cookie, xsrf_token, inicio):
+                return  # _login_por_cookie ya dejó el error listo en _jobs
+
+            _escanear_periodos(job_id, page, codigo, periodo_especifico, inicio)
+    except Exception:
+        logger.exception("Job %s: error durante la sincronización con Intralú (cookie)", job_id)
+        with _jobs_lock:
+            _jobs[job_id]["status"] = "error"
+            _jobs[job_id]["status_code"] = 500
+            _jobs[job_id]["detail"] = "No se pudo completar la sincronización con Intralú. Intenta de nuevo más tarde."
+        logger.info("Job %s: ❌ TERMINÓ CON ERROR tras %.1fs", job_id, time.time() - inicio)
+    finally:
+        if browser:
+            try:
+                browser.close()
+            except Exception:
+                pass
+        _semaforo_sync.release()
+
+
+def _ejecutar_sync_legacy_password(job_id, codigo, password, periodo_especifico=None):
+    """Flujo VIEJO (pre-reCAPTCHA). NO se usa — se conserva completo
+    por si Intralú algún día retira el reCAPTCHA de su login; en ese
+    caso alcanza con volver a exponer un endpoint que llame a esta
+    función. Hoy no hay ninguna ruta que la invoque."""
+    periodo_especifico = normalizar_periodo(periodo_especifico)
+    adquirido = _semaforo_sync.acquire(blocking=False)
+    if not adquirido:
+        with _jobs_lock:
+            _jobs[job_id]["status"] = "error"
+            _jobs[job_id]["status_code"] = 429
+            _jobs[job_id]["detail"] = "Hay muchas sincronizaciones en curso ahora mismo. Intenta de nuevo en un minuto."
+        logger.info("Job %s: ❌ RECHAZADO (ya hay %d syncs en curso)", job_id, MAX_SYNCS_SIMULTANEOS)
+        return
+
+    inicio = time.time()
+    browser = None
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+
+            if not _login_legacy_password(page, job_id, codigo, password, inicio):
+                return
+
+            _escanear_periodos(job_id, page, codigo, periodo_especifico, inicio)
+    except Exception:
+        logger.exception("Job %s: error durante la sincronización con Intralú (legacy)", job_id)
+        with _jobs_lock:
+            _jobs[job_id]["status"] = "error"
+            _jobs[job_id]["status_code"] = 500
+            _jobs[job_id]["detail"] = "No se pudo completar la sincronización con Intralú. Intenta de nuevo más tarde."
+        logger.info("Job %s: ❌ TERMINÓ CON ERROR tras %.1fs", job_id, time.time() - inicio)
     finally:
         if browser:
             try:
@@ -448,9 +579,12 @@ def _ejecutar_sync(job_id, codigo, password, periodo_especifico=None):
 
 
 @app.post("/api/sync-intralu")
-def iniciar_sync(credentials: LoginRequest):
+def iniciar_sync(credentials: LoginPorCookieRequest):
     """Responde AL INSTANTE con un job_id — no espera a que termine el
-    scraping. La sincronización real corre en un hilo aparte."""
+    scraping. La sincronización real corre en un hilo aparte. Desde
+    que Intralú agregó reCAPTCHA a su login, este endpoint recibe la
+    cookie de sesión (leída por la extensión 'SIGA Conector'), no
+    código+contraseña."""
     _limpiar_jobs_viejos()
 
     job_id = str(uuid.uuid4())
@@ -462,8 +596,8 @@ def iniciar_sync(credentials: LoginRequest):
         }
 
     hilo = threading.Thread(
-        target=_ejecutar_sync,
-        args=(job_id, credentials.codigo, credentials.password, credentials.periodo),
+        target=_ejecutar_sync_cookie,
+        args=(job_id, credentials.session_cookie, credentials.xsrf_token, credentials.codigo, credentials.periodo),
         daemon=True,
     )
     hilo.start()
