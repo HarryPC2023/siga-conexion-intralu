@@ -48,22 +48,16 @@ _semaforo_sync = threading.Semaphore(MAX_SYNCS_SIMULTANEOS)
 
 
 class LoginRequest(BaseModel):
-    codigo: str = Field(..., examples=["20231059E"], description="Tu código de estudiante UNI (el mismo de Intralú).")
-    password: str = Field(..., examples=["tu_contraseña_de_intralu"], description="Tu contraseña de Intralú. Nunca se guarda.")
-    periodo: str | None = Field(
-        default=None,
-        examples=["20262"],
-        description=(
-            "OPCIONAL. Déjalo vacío/null para sincronizar TODOS tus periodos "
-            "desde tu año de ingreso. Para uno solo, usa el formato crudo "
-            "AÑO+TIPO ('20262' = 2026-2, '20263' = verano 2026-3) — también "
-            "acepta el formato con guion ('2026-2')."
-        ),
-    )
+    """Usado SOLO por /api/sync-horarios (Matrícula UNI) — sistema de
+    autenticación totalmente aparte de Intralú, que NO tiene reCAPTCHA,
+    así que aquí código+contraseña sigue funcionando normal."""
+    codigo: str = Field(..., examples=["20231059E"], description="Tu código de estudiante UNI.")
+    password: str = Field(..., examples=["tu_contraseña"], description="Tu contraseña de Matrícula UNI. Nunca se guarda.")
+    periodo: str | None = Field(default=None, examples=["20262"])
 
 
 class LoginPorCookieRequest(BaseModel):
-    """Reemplaza a LoginRequest para /api/sync-intralu ahora que Intralú
+    """Para /api/sync-intralu, ahora que Intralú
     agregó reCAPTCHA a su login: en vez de código+contraseña, el
     alumno inicia sesión él mismo (resolviendo el reCAPTCHA) y la
     extensión de Chrome 'SIGA Conector' lee las cookies de esa sesión
@@ -229,29 +223,6 @@ def simplificar_etiqueta(texto):
     if "EXAMEN SUSTITUTORIO" in t:
         return "ES"
     return t
-
-
-def _login_legacy_password(page, job_id, codigo, password, inicio):
-    """Login viejo por código+contraseña. YA NO SE USA — Intralú agregó
-    reCAPTCHA a este formulario y este flujo se queda atascado ahí.
-    Se conserva sin ruta expuesta por si algún día Intralú quita el
-    reCAPTCHA; en ese caso solo hace falta volver a exponer un endpoint
-    que llame a esta función. Devuelve True si el login funcionó."""
-    page.goto("https://alumnos.uni.edu.pe/login", wait_until="domcontentloaded")
-    page.fill("#txt-codigo", codigo)
-    page.fill("#txt-password", password)
-    page.click("#btn-login")
-
-    try:
-        page.wait_for_url("**/home**", timeout=20000)
-        return True
-    except Exception:
-        with _jobs_lock:
-            _jobs[job_id]["status"] = "error"
-            _jobs[job_id]["status_code"] = 401
-            _jobs[job_id]["detail"] = "Código o contraseña incorrectos en Intralú."
-        logger.info("Job %s: ❌ LOGIN FALLIDO tras %.1fs", job_id, time.time() - inicio)
-        return False
 
 
 def _login_por_cookie(context, page, job_id, session_cookie, xsrf_token, inicio):
@@ -522,48 +493,6 @@ def _ejecutar_sync_cookie(job_id, session_cookie, xsrf_token, codigo, periodo_es
             _escanear_periodos(job_id, page, codigo, periodo_especifico, inicio)
     except Exception:
         logger.exception("Job %s: error durante la sincronización con Intralú (cookie)", job_id)
-        with _jobs_lock:
-            _jobs[job_id]["status"] = "error"
-            _jobs[job_id]["status_code"] = 500
-            _jobs[job_id]["detail"] = "No se pudo completar la sincronización con Intralú. Intenta de nuevo más tarde."
-        logger.info("Job %s: ❌ TERMINÓ CON ERROR tras %.1fs", job_id, time.time() - inicio)
-    finally:
-        if browser:
-            try:
-                browser.close()
-            except Exception:
-                pass
-        _semaforo_sync.release()
-
-
-def _ejecutar_sync_legacy_password(job_id, codigo, password, periodo_especifico=None):
-    """Flujo VIEJO (pre-reCAPTCHA). NO se usa — se conserva completo
-    por si Intralú algún día retira el reCAPTCHA de su login; en ese
-    caso alcanza con volver a exponer un endpoint que llame a esta
-    función. Hoy no hay ninguna ruta que la invoque."""
-    periodo_especifico = normalizar_periodo(periodo_especifico)
-    adquirido = _semaforo_sync.acquire(blocking=False)
-    if not adquirido:
-        with _jobs_lock:
-            _jobs[job_id]["status"] = "error"
-            _jobs[job_id]["status_code"] = 429
-            _jobs[job_id]["detail"] = "Hay muchas sincronizaciones en curso ahora mismo. Intenta de nuevo en un minuto."
-        logger.info("Job %s: ❌ RECHAZADO (ya hay %d syncs en curso)", job_id, MAX_SYNCS_SIMULTANEOS)
-        return
-
-    inicio = time.time()
-    browser = None
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
-
-            if not _login_legacy_password(page, job_id, codigo, password, inicio):
-                return
-
-            _escanear_periodos(job_id, page, codigo, periodo_especifico, inicio)
-    except Exception:
-        logger.exception("Job %s: error durante la sincronización con Intralú (legacy)", job_id)
         with _jobs_lock:
             _jobs[job_id]["status"] = "error"
             _jobs[job_id]["status_code"] = 500
