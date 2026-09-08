@@ -312,6 +312,25 @@ def _escanear_periodos(job_id, page, codigo, periodo_especifico, inicio):
                         nombre = cols[1].inner_text().strip()
                         creditos = cols[2].inner_text().strip()
 
+                        # Columna "NOTA" de esta misma tabla (índice 5: CURSO,
+                        # NOMBRE, CRÉDITOS, TIPO, CONDICIÓN, NOTA, OPCIÓN) — es
+                        # el promedio final YA calculado y registrado por la
+                        # UNI para ese curso, que en casos puntuales (ajuste
+                        # manual del profesor, etc.) no coincide exactamente
+                        # con el resultado de aplicar la fórmula pública a las
+                        # notas de PC1-4/EP/EF. Se captura acá porque ya
+                        # estamos parados en esta fila — no hace falta ninguna
+                        # visita adicional a Intralú. El frontend decide qué
+                        # hacer con ella (usarla como referencia oficial si
+                        # difiere de lo que él mismo calcula).
+                        nota_oficial = None
+                        if len(cols) >= 6:
+                            nota_raw = cols[5].inner_text().strip()
+                            try:
+                                nota_oficial = float(nota_raw.replace(",", "."))
+                            except ValueError:
+                                nota_oficial = None
+
                         if (
                             cod_raw
                             and "-" in cod_raw
@@ -326,6 +345,7 @@ def _escanear_periodos(job_id, page, codigo, periodo_especifico, inicio):
                                     "seccion": seccion,
                                     "nombre": nombre,
                                     "creditos": creditos,
+                                    "nota_oficial": nota_oficial,
                                 }
                             )
 
@@ -436,6 +456,7 @@ def _escanear_periodos(job_id, page, codigo, periodo_especifico, inicio):
                             if creditos_val.isdigit()
                             else creditos_val,
                             "evaluaciones": evaluaciones,
+                            "nota_oficial": c_info.get("nota_oficial"),
                         }
                     )
 
