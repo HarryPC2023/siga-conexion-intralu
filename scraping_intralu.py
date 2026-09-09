@@ -376,6 +376,11 @@ def _escanear_periodos(job_id, page, codigo, periodo_especifico, inicio):
 
                     evaluaciones = []
                     for intento in range(1, MAX_INTENTOS_NOTAS + 1):
+                        with _jobs_lock:
+                            if _jobs[job_id].get("cancelado"):
+                                _jobs[job_id]["status"] = "cancelado"
+                                logger.info("Job %s: 🛑 CANCELADO por el usuario tras %.1fs", job_id, time.time() - inicio)
+                                return
                         # networkidle (no domcontentloaded): la tabla de notas de
                         # esta página en particular parece cargar vía JS después
                         # del render inicial — con domcontentloaded llegábamos
