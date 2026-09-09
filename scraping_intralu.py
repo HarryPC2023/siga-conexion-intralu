@@ -30,7 +30,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=ORIGENES_PERMITIDOS,
     allow_credentials=False,
-    allow_methods=["POST"],
+    allow_methods=["POST", "GET", "DELETE"],
     allow_headers=["Content-Type"],
 )
 
@@ -288,6 +288,10 @@ def _escanear_periodos(job_id, page, codigo, periodo_especifico, inicio):
             # 3. Recorrer cada periodo del rango
             for periodo in periodos:
                 with _jobs_lock:
+                    if _jobs[job_id].get("cancelado"):
+                        _jobs[job_id]["status"] = "cancelado"
+                        logger.info("Job %s: 🛑 CANCELADO por el usuario tras %.1fs", job_id, time.time() - inicio)
+                        return
                     _jobs[job_id]["periodo_actual"] = periodo
                 logger.info("Job %s: revisando periodo %s...", job_id, periodo)
 
@@ -360,6 +364,11 @@ def _escanear_periodos(job_id, page, codigo, periodo_especifico, inicio):
                 MAX_INTENTOS_NOTAS = 2
                 cursos_lista = []
                 for c_info in cursos_temp:
+                    with _jobs_lock:
+                        if _jobs[job_id].get("cancelado"):
+                            _jobs[job_id]["status"] = "cancelado"
+                            logger.info("Job %s: 🛑 CANCELADO por el usuario tras %.1fs", job_id, time.time() - inicio)
+                            return
                     logger.info(
                         "Job %s:   -> %s (%s)", job_id, c_info["cod_curso"], periodo,
                     )
@@ -576,6 +585,21 @@ def consultar_sync(job_id: str):
             "periodo_actual": job.get("periodo_actual"),
             "periodos": job.get("periodos"),
         }
+
+
+@app.delete("/api/sync-intralu/{job_id}")
+def cancelar_sync(job_id: str):
+    """El frontend llama esto cuando el usuario presiona "Cancelar" a
+    mitad de una sincronización. No corta a Playwright al instante —
+    puede estar en medio de un page.goto() — pero _escanear_periodos
+    revisa este flag entre cada curso y cada periodo, así que en la
+    práctica corta en cuestión de segundos en vez de dejar correr los
+    minutos que faltaban."""
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if job:
+            job["cancelado"] = True
+    return {"ok": True}
 
 
 # ================================================================
